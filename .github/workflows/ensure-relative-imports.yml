@@ -1,0 +1,45 @@
+name: Ensure Relative Imports in Frontend
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-ensure-relative-imports
+  cancel-in-progress: true
+
+
+jobs:
+  ensure-relative-imports:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Read build information
+        uses: ./.github/actions/build_info
+
+      - name: Set up virtual environment
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Build @streamlit/lib
+        working-directory: frontend
+        run: yarn workspace @streamlit/lib build
+
+      - name: Check for relative imports
+        run: ./scripts/ensure_relative_imports.sh
