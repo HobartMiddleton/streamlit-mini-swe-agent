@@ -1,0 +1,82 @@
+name: Playwright E2E Tests - Custom Components
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      # Don't run CI if changes are only in documentation/spec folders:
+      - "specs/**"
+      - "wiki/**"
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-playwright-custom-component
+  cancel-in-progress: true
+
+
+jobs:
+  playwright-e2e-tests-custom-components:
+    name: Playwright E2E Tests - Custom Components
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Streamlit code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Set up build information
+        uses: ./.github/actions/build_info
+
+      - name: Set up virtual environment
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Install Playwright browsers
+        uses: ./.github/actions/playwright_install
+
+      - name: Build frontend
+        run: make frontend-fast
+
+      - name: Install custom component test dependencies
+        run: uv pip install -r e2e_playwright/custom_components/components-e2e-requirements.txt
+
+      - name: Clean old test results
+        run: rm -rf e2e_playwright/test-results
+
+      - name: Run custom component E2E tests
+        working-directory: e2e_playwright
+        run: |
+          uv run pytest custom_components \
+            --browser webkit \
+            --browser chromium \
+            --browser firefox \
+            -n auto \
+            --reruns 3 \
+            --reruns-delay 1 \
+            --tracing retain-on-failure
+
+      - name: Determine tested commit short SHA
+        id: tested-commit
+        if: always()
+        env:
+          TESTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: echo "short_sha=${TESTED_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload custom component test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: playwright-custom-components-test-results-${{ steps.tested-commit.outputs.short_sha }}
+          path: e2e_playwright/test-results
+          if-no-files-found: warn
