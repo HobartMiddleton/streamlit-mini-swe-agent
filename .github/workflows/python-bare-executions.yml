@@ -1,0 +1,41 @@
+name: Python Bare Execution Tests
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-bare-executions
+  cancel-in-progress: true
+
+
+jobs:
+  py-bare-executions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Read build info
+        uses: ./.github/actions/build_info
+
+      - name: Initialize virtual environment
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Run Python bare execution tests
+        run: make bare-execution-tests
