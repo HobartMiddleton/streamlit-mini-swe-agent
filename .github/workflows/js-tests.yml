@@ -1,0 +1,304 @@
+name: Javascript Unit Tests
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-javascript
+  cancel-in-progress: true
+
+
+jobs:
+  js-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Read build info
+        uses: ./.github/actions/build_info
+
+      - name: Set up development environment
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Check frontend yarn.lock deduplication
+        run: ./scripts/check_yarn_dedupe.sh frontend
+
+      - name: Build frontend workspaces
+        run: |
+          cd frontend
+          yarn workspaces foreach --recursive --topological --parallel --from @streamlit/lib run build
+
+      - name: Audit frontend dependency licenses
+        run: uv run python scripts/audit_frontend_licenses.py
+
+      - name: Check frontend type synchronization
+        run: make frontend-typesync
+
+      - name: Check frontend types
+        run: make frontend-types
+
+      - name: Lint frontend
+        run: make frontend-lint
+
+      - name: Run Knip with GitHub annotations
+        id: knip_annotations
+        continue-on-error: true
+        run: cd frontend && yarn knip --reporter github-actions
+
+      - name: Run Knip with JSON report
+        id: knip_json
+        continue-on-error: true
+        run: cd frontend && yarn knip --reporter json > knip-report.json
+
+      - name: Upload Knip JSON report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: knip-report
+          path: frontend/knip-report.json
+          if-no-files-found: warn
+
+      - name: Fail when Knip reports issues
+        if: always() && (steps.knip_annotations.outcome == 'failure' || steps.knip_json.outcome == 'failure')
+        run: |
+          echo "::error title=Knip dependency analysis failed::Knip reported dependency analysis issues. See the workflow annotations and the uploaded JSON report."
+          exit 1
+
+      - name: Update and verify NOTICES
+        run: |
+          make update-notices
+          if ! git diff --exit-code -- NOTICES; then
+            echo "::error title=NOTICES is out of date::Run 'make update-notices' and commit the resulting NOTICES changes."
+            exit 1
+          fi
+
+      - name: Run frontend unit tests
+        run: make frontend-tests
+
+      - name: Upload coverage JSON summary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-json
+          path: frontend/coverage/coverage-summary.json
+          if-no-files-found: error
+
+      - name: Upload coverage HTML report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-html
+          path: frontend/coverage
+          if-no-files-found: error
+
+  js-coverage-comment:
+    needs: js-unit-tests
+    if: ${{ github.event_name == 'pull_request' && needs['js-unit-tests'].result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Download current coverage JSON summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-json
+          path: coverage-current
+
+      - name: Find latest successful baseline run
+        id: baseline
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: "js-tests.yml",
+              branch: "develop",
+              status: "success",
+              per_page: 1,
+            });
+
+            if (runs.data.workflow_runs.length === 0) {
+              core.setFailed(
+                "No successful js-tests.yml workflow run was found on the develop branch.",
+              );
+              return;
+            }
+
+            const runId = runs.data.workflow_runs[0].id;
+            core.info(`Using baseline workflow run ${runId} from ${owner}/${repo}.`);
+            core.setOutput("run-id", runId);
+
+      - name: Download baseline coverage JSON summary
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-json
+          path: coverage-baseline
+          repository: streamlit/streamlit
+          run-id: ${{ steps.baseline.outputs.run-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compare coverage and maintain PR comment
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          CURRENT_COVERAGE_DIR: coverage-current
+          BASELINE_COVERAGE_DIR: coverage-baseline
+          COVERAGE_CHANGE_THRESHOLD: "0.1"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const marker = "<!-- streamlit-frontend-test-coverage -->";
+            const threshold = Number(process.env.COVERAGE_CHANGE_THRESHOLD);
+
+            function findCoverageSummary(root) {
+              const entries = fs.readdirSync(root, { withFileTypes: true });
+              for (const entry of entries) {
+                const entryPath = path.join(root, entry.name);
+                if (entry.isDirectory()) {
+                  const nested = findCoverageSummary(entryPath);
+                  if (nested) {
+                    return nested;
+                  }
+                } else if (entry.name === "coverage-summary.json") {
+                  return entryPath;
+                }
+              }
+              return null;
+            }
+
+            function readLineCoverage(root) {
+              const summaryPath = findCoverageSummary(root);
+              if (!summaryPath) {
+                throw new Error(`coverage-summary.json not found under ${root}`);
+              }
+
+              const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8"));
+              const lines = summary.total && summary.total.lines;
+              if (
+                !lines ||
+                !Number.isFinite(Number(lines.pct)) ||
+                !Number.isFinite(Number(lines.total)) ||
+                !Number.isFinite(Number(lines.covered))
+              ) {
+                throw new Error(`Invalid total line coverage in ${summaryPath}`);
+              }
+
+              const total = Number(lines.total);
+              const covered = Number(lines.covered);
+              return {
+                pct: Number(lines.pct),
+                total,
+                uncovered: Math.max(total - covered, 0),
+              };
+            }
+
+            function formatPct(value) {
+              return `${value.toFixed(2)}%`;
+            }
+
+            function formatChange(value) {
+              return `${value >= 0 ? "+" : ""}${value.toFixed(2)} percentage points`;
+            }
+
+            try {
+              if (!Number.isFinite(threshold) || threshold < 0) {
+                throw new Error(
+                  `Invalid coverage change threshold: ${process.env.COVERAGE_CHANGE_THRESHOLD}`,
+                );
+              }
+
+              const current = readLineCoverage(process.env.CURRENT_COVERAGE_DIR);
+              const baseline = readLineCoverage(process.env.BASELINE_COVERAGE_DIR);
+              const rawChange = current.pct - baseline.pct;
+              const change = Number(rawChange.toFixed(2));
+              const issueNumber = context.issue.number;
+              const comparisonUrl = `https://issues.streamlit.app/Test_Coverage_(Frontend)?pr=${issueNumber}`;
+
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issueNumber,
+                per_page: 100,
+              });
+              const existingComment = comments.find(
+                (comment) =>
+                  typeof comment.body === "string" && comment.body.includes(marker),
+              );
+
+              if (!existingComment && Math.abs(rawChange) < threshold) {
+                core.info(
+                  `Coverage change of ${formatChange(change)} is below the ${threshold.toFixed(2)} percentage point threshold; no comment was created.`,
+                );
+                return;
+              }
+
+              const direction =
+                change > 0
+                  ? "increased"
+                  : change < 0
+                    ? "decreased"
+                    : "remained unchanged";
+              const body = [
+                marker,
+                "## Frontend test coverage",
+                "",
+                "| Revision | Line coverage | Total lines | Uncovered lines |",
+                "|---|---:|---:|---:|",
+                `| Current | ${formatPct(current.pct)} | ${current.total} | ${current.uncovered} |`,
+                `| Baseline | ${formatPct(baseline.pct)} | ${baseline.total} | ${baseline.uncovered} |`,
+                "",
+                `Coverage ${direction} by ${formatChange(change)}.`,
+                "",
+                `[View the detailed coverage comparison for PR #${issueNumber}](${comparisonUrl})`,
+              ].join("\n");
+
+              if (existingComment) {
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: existingComment.id,
+                  body,
+                });
+                core.info(`Updated coverage comment ${existingComment.id}.`);
+              } else {
+                const createdComment = await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber,
+                  body,
+                });
+                core.info(`Created coverage comment ${createdComment.data.id}.`);
+              }
+            } catch (error) {
+              core.warning(
+                `Could not compare coverage or update the PR comment: ${error.message}`,
+              );
+            }
