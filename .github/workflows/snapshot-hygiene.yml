@@ -1,0 +1,265 @@
+name: Snapshot Hygiene Check
+
+on:
+  push:
+    branches:
+      - "develop"
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "e2e_playwright/**"
+      - "scripts/snapshot_cleanup.py"
+
+  # Allows workflow to be called from other workflows
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+
+# Avoid duplicate workflows on same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-snapshot-hygiene
+  cancel-in-progress: true
+
+env:
+  FORCE_COLOR: "1"
+
+
+jobs:
+  check-orphaned-snapshots:
+    name: Check orphaned snapshots
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+
+      - name: Read build information
+        id: build_info
+        uses: ./.github/actions/build_info
+
+      - name: Initialize development environment
+        id: make_init
+        uses: ./.github/actions/make_init
+        with:
+          python_version: ${{ env.PYTHON_MAX_VERSION }}
+
+      - name: Check for orphaned snapshots
+        id: check
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          python scripts/snapshot_cleanup.py --ci > snapshot_cleanup_output.txt 2>&1
+          exit_code=$?
+          set -e
+
+          cat snapshot_cleanup_output.txt
+
+          echo "exit_code=$exit_code" >> "$GITHUB_OUTPUT"
+          if [ "$exit_code" -eq 0 ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failure" >> "$GITHUB_OUTPUT"
+          fi
+
+          {
+            echo "output<<SNAPSHOT_HYGIENE_OUTPUT_EOF"
+            cat snapshot_cleanup_output.txt
+            echo
+            echo "SNAPSHOT_HYGIENE_OUTPUT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$exit_code" -ne 0 ]; then
+            echo "::error::Snapshot hygiene check failed with exit code $exit_code."
+            exit "$exit_code"
+          fi
+
+      - name: Remove stale snapshot hygiene comment
+        id: delete_stale_comment
+        if: github.event_name == 'pull_request' && steps.check.outcome == 'success' && steps.check.outputs.exit_code == '0'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c7db3c # v7.0.1
+        with:
+          script: |
+            const marker = '<!-- streamlit-snapshot-hygiene -->';
+            const prNumber = context.payload.pull_request?.number ?? context.issue?.number;
+            if (!prNumber) {
+              core.info('No pull request number found; skipping comment cleanup.');
+              return;
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const isBot = (user) =>
+              Boolean(user) &&
+              (user.type === 'Bot' || /\[bot\]$/i.test(user.login || ''));
+
+            const matchingComments = comments.filter(
+              (comment) =>
+                isBot(comment.user) &&
+                typeof comment.body === 'string' &&
+                comment.body.includes(marker)
+            );
+
+            if (matchingComments.length === 0) {
+              core.info('No stale snapshot hygiene comments found.');
+              return;
+            }
+
+            for (const comment of matchingComments) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+              });
+              core.info('Deleted stale snapshot hygiene comment ' + comment.id + '.');
+            }
+
+      - name: Publish orphaned snapshot warning comment
+        id: publish_warning
+        if: always() && github.event_name == 'pull_request' && (failure() || steps.check.outcome == 'failure' || steps.delete_stale_comment.outcome == 'failure')
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c7db3c # v7.0.1
+        env:
+          CHECK_OUTPUT: ${{ steps.check.outputs.output }}
+          CHECK_EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+        with:
+          script: |
+            const marker = '<!-- streamlit-snapshot-hygiene -->';
+            const output = (process.env.CHECK_OUTPUT || '').trim();
+            const exitCode = process.env.CHECK_EXIT_CODE || 'unknown';
+            const prNumber = context.payload.pull_request?.number ?? context.issue?.number;
+            if (!prNumber) {
+              core.info('No pull request number found; skipping comment publication.');
+              return;
+            }
+
+            const isBot = (user) =>
+              Boolean(user) &&
+              (user.type === 'Bot' || /\[bot\]$/i.test(user.login || ''));
+
+            function extractByTest(text) {
+              const heading = 'Orphaned snapshots by test:';
+              const start = text.indexOf(heading);
+              if (start === -1) {
+                return '';
+              }
+              let section = text.slice(start + heading.length);
+              const copyStart = section.indexOf('--- COPY_PASTE_START ---');
+              if (copyStart !== -1) {
+                section = section.slice(0, copyStart);
+              }
+              return section
+                .split('\n')
+                .map((line) => line.trim())
+                .filter((line) => line.length > 0)
+                .map((line) => '- ' + line)
+                .join('\n');
+            }
+
+            function extractSnapshotList(text) {
+              const startMarker = '--- COPY_PASTE_START ---';
+              const endMarker = '--- COPY_PASTE_END ---';
+              const start = text.indexOf(startMarker);
+              if (start === -1) {
+                return '';
+              }
+              const end = text.indexOf(endMarker, start + startMarker.length);
+              if (end === -1) {
+                return '';
+              }
+              return text.slice(start + startMarker.length, end).trim();
+            }
+
+            const summary = extractByTest(output);
+            const snapshotList = extractSnapshotList(output);
+            const rawOutput =
+              output.length > 50000 ? output.slice(0, 50000) + '\n... (truncated)' : output;
+
+            const body = [
+              marker,
+              '## ⚠️ Orphaned E2E snapshot check failed',
+              '',
+              'The snapshot hygiene check did not pass. This can mean that orphaned E2E snapshots were found, or that the check script failed while running.',
+              '',
+              '**Check exit code:** `' + exitCode + '`',
+              '',
+              '### Snapshots by test',
+              '',
+              summary || '_No by-test summary was available from the detection output._',
+              '',
+              '### Copyable snapshot file list',
+              '',
+              '```text',
+              snapshotList || 'No snapshot file list was available from the detection output.',
+              '```',
+              '',
+              '### Suggested next steps',
+              '',
+              '1. **Review manually:** Verify that each snapshot listed above is really unused. The check is based on static analysis and can produce false positives.',
+              '2. **Reproduce locally:** Run `python scripts/snapshot_cleanup.py --ci` from the repository root to see the same diagnostic output.',
+              '3. **Clean up locally:** Preview the cleanup with `python scripts/snapshot_cleanup.py --dry-run`, then run `python scripts/snapshot_cleanup.py` to delete the orphaned snapshots.',
+              '4. **Exclude false positives:** If a snapshot is still used but cannot be detected statically, add its filename to `DISALLOWED_SNAPSHOTS` in `scripts/snapshot_cleanup.py`.',
+              '5. **Commit the fix:** Commit and push the snapshot deletions and/or the false-positive allow-list update so this check can run again.',
+              '',
+              '> This workflow only posts suggestions. It does not delete snapshots or commit changes automatically.',
+              '',
+              '<details>',
+              '<summary>Full detection output</summary>',
+              '',
+              '```text',
+              rawOutput || 'No detection output was captured.',
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const matchingComments = comments.filter(
+              (comment) =>
+                isBot(comment.user) &&
+                typeof comment.body === 'string' &&
+                comment.body.includes(marker)
+            );
+
+            if (matchingComments.length > 0) {
+              const comment = matchingComments[0];
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: comment.id,
+                body,
+              });
+              core.info('Updated existing snapshot hygiene comment ' + comment.id + '.');
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                body,
+              });
+              core.info('Created a new snapshot hygiene comment.');
+            }
+
+      - name: Fail snapshot hygiene check
+        if: always() && (steps.check.outcome == 'failure' || (steps.check.outputs.exit_code != '' && steps.check.outputs.exit_code != '0'))
+        shell: bash
+        run: |
+          echo "::error::Snapshot hygiene check failed. See the job log for the full diagnostic output."
+          exit 1
